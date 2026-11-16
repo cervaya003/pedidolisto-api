@@ -36,6 +36,17 @@ function fakeChannel(channel, { appliesTo = () => true, render = formatOrderMess
 }
 
 const notifier = fakeChannel("telegram");
+// Avisos posteriores (comprobante, cambio de estado): se guardan para revisarlos.
+const messengers = {
+  proofs: [],
+  statuses: [],
+  async proofReceived(order) {
+    this.proofs.push(order.number);
+  },
+  async statusChanged(order) {
+    this.statuses.push(`${order.number}:${order.status}`);
+  },
+};
 const receiptMail = fakeChannel("customerEmail", { appliesTo: (order) => Boolean(order.customer.email), render: (order) => customerEmail(order).subject });
 
 let mongo;
@@ -80,7 +91,7 @@ before(async () => {
     CORS_ORIGINS: "http://localhost:5173",
     ORDER_MAX_PER_WINDOW: "200",
   });
-  app = await buildApp(env, { orderNotifiers: [notifier, receiptMail] });
+  app = await buildApp(env, { orderNotifiers: [notifier, receiptMail], orderMessengers: messengers });
   await app.ready();
 
   token = (await app.inject({ method: "POST", url: api("/auth/login"), payload: { password: PASSWORD } })).json().token;
@@ -91,6 +102,7 @@ before(async () => {
   site.business.deliveryPoints = [{ name: "Oficina centro", details: "Recepción, 9 a 18 h" }];
   site.business.homeDelivery = true;
   site.business.deliveryAreas = [{ city: "Querétaro", state: "Querétaro" }];
+  site.business.payment = { ...site.business.payment, enabled: true, bank: "BBVA", holder: "Ana López", clabe: "032180000118359719", depositHours: 24 };
   site.products = [
     {
       id: "pastel",
@@ -105,6 +117,8 @@ before(async () => {
       ],
     },
     { id: "galletas", name: "Galletas", categoryId, price: 120 },
+    { id: "encargo", name: "Pastel por encargo", categoryId, price: 400, depositType: "percent", depositValue: 50 },
+    { id: "boda", name: "Pastel de boda", categoryId, price: 1000, depositType: "fixed", depositValue: 300 },
     { id: "oculto", name: "Oculto", categoryId, price: 10, active: false },
   ];
   const saved = await app.inject({ method: "PUT", url: api("/admin/site"), headers, payload: site });
@@ -426,6 +440,20 @@ describe("correos", () => {
     assert.match(mail.html, /background:#18181b/);
   });
 
+  test("al cliente: solo la tarjeta y el titular para transferir; sin datos, no aparece", () => {
+    const payment = { bank: "BBVA", holder: "Ana López", clabe: "032180000118359719", card: "4111111111111111", account: "", phone: "", qrUrl: "", instructions: "Manda tu <comprobante>" };
+    const mail = customerEmail({ ...order, brand: { name: "Dulce Atelier", payment } });
+    assert.match(mail.html, /Datos para tu pago/);
+    assert.match(mail.html, /4111 1111 1111 1111/, "tarjeta en grupos de 4");
+    assert.match(mail.html, /Ana López/);
+    assert.doesNotMatch(mail.html, /0321 8000/, "con tarjeta no se repite la CLABE");
+    assert.match(mail.html, /Manda tu &lt;comprobante&gt;/, "escapa las instrucciones");
+    const onlyClabe = customerEmail({ ...order, brand: { payment: { ...payment, card: "" } } });
+    assert.match(onlyClabe.html, /0321 8000 0118 3597 19/, "sin tarjeta usa la CLABE");
+    assert.doesNotMatch(customerEmail(order).html, /Datos para tu pago/);
+    assert.doesNotMatch(businessEmail({ ...order, brand: { payment } }).html, /Datos para tu pago/, "el negocio no necesita sus propios datos");
+  });
+
   test("miniaturas: Unsplash y Cloudinary recortadas; nada de localhost ni http", () => {
     assert.match(thumbnail("https://res.cloudinary.com/x/image/upload/v1/a.webp"), /\/upload\/c_fill,w_128,h_128,q_auto,f_jpg\/v1\/a\.webp$/);
     assert.equal(thumbnail("http://localhost:3000/api/v1/images/abc"), "");
@@ -489,5 +517,124 @@ describe("configuración de Telegram", () => {
     assert.throws(() => loadEnv({ ...base, TELEGRAM_BOT_TOKEN: "token-falso", TELEGRAM_CHAT_ID: "1" }), /BotFather/);
     const env = loadEnv({ ...base, TELEGRAM_BOT_TOKEN: `123456:${"A".repeat(35)}`, TELEGRAM_CHAT_ID: "-100123" });
     assert.equal(env.TELEGRAM.chatId, "-100123");
+  });
+});
+
+describe("anticipos, comprobantes y estados", () => {
+  const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
+  const auth = () => ({ authorization: `Bearer ${token}` });
+  const uploadProof = (publicId, body = PNG, type = "image/png") =>
+    app.inject({ method: "POST", url: api(`/orders/${publicId}/proof`), headers: { "content-type": type }, payload: body });
+  const setStatus = (number, status) => app.inject({ method: "PATCH", url: api(`/admin/orders/${number}/status`), headers: auth(), payload: { status } });
+  const encargo = (quantity = 1) => [{ productId: "encargo", quantity }];
+
+  test("un producto con anticipo deja el pedido esperando el pago, con plazo", async () => {
+    const response = await postOrder({ items: [...encargo(2), { productId: "boda", quantity: 1 }, { productId: "galletas", quantity: 1 }] });
+    assert.equal(response.statusCode, 201, response.body);
+    const receipt = response.json();
+    // 50 % de 800 + 300 fijos; las galletas no piden anticipo.
+    assert.equal(receipt.deposit, 700);
+    assert.equal(receipt.status, "awaiting_deposit");
+    const hours = (new Date(receipt.depositDueAt) - new Date(receipt.createdAt)) / 3_600_000;
+    assert.equal(Math.round(hours), 24);
+  });
+
+  test("sin productos con anticipo, el pedido es «nuevo» y sin plazo", async () => {
+    const receipt = (await postOrder({ items: [{ productId: "galletas", quantity: 1 }] })).json();
+    assert.equal(receipt.deposit, 0);
+    assert.equal(receipt.status, "new");
+    assert.equal(receipt.depositDueAt, null);
+  });
+
+  test("el aviso de Telegram dice cuánto anticipo esperar", async () => {
+    await postOrder({ items: encargo() });
+    await waitFor(() => notifier.sent.length === 1);
+    assert.match(notifier.sent[0], /Anticipo: \$200\.00/);
+    assert.match(notifier.sent[0], /resta \$200\.00/);
+  });
+
+  test("el cliente sube su comprobante; solo el admin lo puede ver", async () => {
+    messengers.proofs = [];
+    const receipt = (await postOrder({ items: encargo() })).json();
+    const uploaded = await uploadProof(receipt.publicId);
+    assert.equal(uploaded.statusCode, 201, uploaded.body);
+    assert.equal(uploaded.json().proofCount, 1);
+    assert.deepEqual(messengers.proofs, [receipt.number], "avisa al negocio");
+
+    const list = (await app.inject({ method: "GET", url: api("/admin/orders?status=awaiting_deposit"), headers: auth() })).json();
+    const order = list.orders.find((item) => item.number === receipt.number);
+    assert.equal(order.proofs.length, 1);
+    const proofUrl = api(`/admin/orders/proofs/${order.proofs[0].id}`);
+    assert.equal((await app.inject({ method: "GET", url: proofUrl })).statusCode, 401, "sin sesión no se ve");
+    const image = await app.inject({ method: "GET", url: proofUrl, headers: auth() });
+    assert.equal(image.statusCode, 200);
+    assert.equal(image.headers["content-type"], "image/png");
+    assert.match(image.headers["cache-control"], /no-store/);
+  });
+
+  test("rechaza comprobantes que no son imagen, de más o de pedidos inexistentes", async () => {
+    const receipt = (await postOrder({ items: encargo() })).json();
+    assert.equal((await uploadProof(receipt.publicId, Buffer.from("<script>alert(1)</script>"), "image/png")).statusCode, 415, "firma falsa");
+    for (let index = 0; index < 3; index++) assert.equal((await uploadProof(receipt.publicId)).statusCode, 201);
+    assert.equal((await uploadProof(receipt.publicId)).statusCode, 409, "máximo 3");
+    assert.equal((await uploadProof("00000000-0000-4000-8000-000000000000")).statusCode, 404);
+  });
+
+  test("confirmar marca el anticipo como pagado y avisa al cliente; luego se entrega", async () => {
+    messengers.statuses = [];
+    const receipt = (await postOrder({ items: encargo() })).json();
+    const confirmed = await setStatus(receipt.number, "confirmed");
+    assert.equal(confirmed.statusCode, 200, confirmed.body);
+    assert.equal(confirmed.json().status, "confirmed");
+    assert.ok(confirmed.json().depositPaidAt);
+    assert.deepEqual(confirmed.json().nextStatuses, ["delivered", "cancelled"]);
+    assert.equal((await setStatus(receipt.number, "delivered")).json().status, "delivered");
+    assert.deepEqual(messengers.statuses, [`${receipt.number}:confirmed`, `${receipt.number}:delivered`]);
+  });
+
+  test("no permite saltos inválidos ni revivir un pedido cancelado", async () => {
+    const receipt = (await postOrder({ items: encargo() })).json();
+    assert.equal((await setStatus(receipt.number, "delivered")).statusCode, 409, "no se entrega sin confirmar");
+    assert.equal((await setStatus(receipt.number, "cancelled")).statusCode, 200);
+    assert.equal((await setStatus(receipt.number, "confirmed")).statusCode, 409);
+    assert.equal((await uploadProof(receipt.publicId)).statusCode, 409, "un cancelado ya no recibe comprobantes");
+    assert.equal((await setStatus(999_999, "confirmed")).statusCode, 404);
+  });
+
+  test("la lista del admin exige sesión, filtra y cuenta por estado", async () => {
+    assert.equal((await app.inject({ method: "GET", url: api("/admin/orders") })).statusCode, 401);
+    const result = (await app.inject({ method: "GET", url: api("/admin/orders?status=open"), headers: auth() })).json();
+    assert.ok(result.orders.length > 0);
+    assert.ok(result.orders.every((order) => ["awaiting_deposit", "new", "confirmed"].includes(order.status)));
+    assert.ok(result.counts.awaiting_deposit > 0);
+    assert.equal(result.orders[0].requestId, undefined, "sin datos internos");
+  });
+
+  test("«Mis pedidos» muestra estado, anticipo y comprobantes del cliente", async () => {
+    const customer = { name: "Ana López", phone: "+525598765432", email: "ana.anticipo@correo.com" };
+    const receipt = (await postOrder({ customer, items: encargo() })).json();
+    await uploadProof(receipt.publicId);
+    const mine = (await app.inject({ method: "POST", url: api("/orders/mine"), payload: { email: customer.email, phone: customer.phone } })).json();
+    const order = mine.orders.find((item) => item.publicId === receipt.publicId);
+    assert.equal(order.status, "awaiting_deposit");
+    assert.equal(order.deposit, 200);
+    assert.equal(order.proofCount, 1);
+  });
+
+  test("el comprobante del cliente muestra el anticipo y los pasos para pagar", () => {
+    const mail = customerEmail({
+      number: 7,
+      customer: { name: "Ana", phone: "+525512345678", email: "a@b.com" },
+      delivery: { type: "arrange" },
+      items: [],
+      total: 800,
+      deposit: 400,
+      depositDueAt: new Date("2026-11-10T19:00:00Z"),
+      currency: "MXN",
+      locale: "es-MX",
+    });
+    assert.match(mail.subject, /falta tu anticipo/);
+    assert.match(mail.html, /\$400\.00/);
+    assert.match(mail.html, /1:00 p\.m\./, "hora de México");
   });
 });

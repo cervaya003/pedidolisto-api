@@ -14,7 +14,7 @@ async function securityPlugin(app, { corsOrigins }) {
 
   await app.register(cors, {
     origin: corsOrigins,
-    methods: ["GET", "POST", "PUT"],
+    methods: ["GET", "POST", "PUT", "PATCH"],
     allowedHeaders: ["Content-Type", "Authorization"],
     maxAge: CORS_MAX_AGE_SECONDS,
   });

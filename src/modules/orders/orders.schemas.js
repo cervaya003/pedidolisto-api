@@ -1,6 +1,6 @@
 // Contrato de POST /orders. Fastify valida y quita campos extra. Los precios NO viajan:
 // el servidor los recalcula con el catálogo publicado.
-import { DELIVERY_TYPES, LIMITS } from "../../shared/catalog.js";
+import { DELIVERY_TYPES, LIMITS, ORDER_STATUSES } from "../../shared/catalog.js";
 import { TEXT_PATTERNS as P } from "../../shared/textRules.js";
 
 // Cada texto público tiene un largo máximo y un patrón de caracteres permitidos.
@@ -72,3 +72,15 @@ export const myOrdersSchema = object(
   },
   ["email", "phone"],
 );
+
+// Comprobante: la URL lleva el publicId (UUID) del pedido.
+export const proofParamsSchema = object({ publicId: { type: "string", pattern: "^[0-9a-f-]{36}$" } }, ["publicId"]);
+
+// Admin.
+export const adminListSchema = object({
+  status: { type: "string", enum: ["", "open", ...Object.keys(ORDER_STATUSES)], default: "" },
+  before: { type: "integer", minimum: 1 },
+});
+export const orderNumberParamsSchema = object({ number: { type: "integer", minimum: 1 } }, ["number"]);
+export const changeStatusSchema = object({ status: { type: "string", enum: Object.keys(ORDER_STATUSES) } }, ["status"]);
+export const proofIdParamsSchema = object({ id: { type: "string", pattern: "^[a-f0-9]{24}$" } }, ["id"]);

@@ -3,6 +3,7 @@ import {
   CARD_SIZES,
   CARD_STYLES,
   CURRENCIES,
+  DEPOSIT_TYPES,
   DESKTOP_COLUMNS,
   FONT_FAMILIES,
   LIMITS,
@@ -64,6 +65,25 @@ const business = object(
       maxItems: LIMITS.DELIVERY_AREAS,
       default: [],
       items: object({ city: { ...name(60), pattern: P.PLACE }, state: { type: "string", maxLength: 60, default: "", pattern: P.PLACE } }, ["city"]),
+    },
+    // Pago por transferencia: lo ve el cliente al terminar su pedido y en su comprobante por correo.
+    // CLABE y tarjeta se revisan (dígito verificador) en site.service.
+    payment: {
+      ...object({
+        enabled: { type: "boolean", default: false },
+        bank: text(60),
+        holder: text(100),
+        clabe: { type: "string", pattern: "^[0-9]{0,18}$", default: "" },
+        card: { type: "string", pattern: "^[0-9]{0,16}$", default: "" },
+        account: { type: "string", pattern: "^[0-9]{0,20}$", default: "" },
+        // Celular para DiMo / transferencia con número de celular.
+        phone: { type: "string", pattern: "^[0-9]{0,10}$", default: "" },
+        qrUrl: URL,
+        instructions: text(300),
+        // Plazo para mandar el anticipo de los productos que lo piden.
+        depositHours: { type: "integer", minimum: LIMITS.DEPOSIT_HOURS_MIN, maximum: LIMITS.DEPOSIT_HOURS_MAX, default: 24 },
+      }),
+      default: {},
     },
   },
   ["name"],
@@ -162,6 +182,9 @@ const product = object(
     customizable: { type: "boolean", default: false },
     allowNotes: { type: "boolean", default: false },
     options: { type: "array", maxItems: LIMITS.PRODUCT_OPTIONS, default: [], items: productOption },
+    // Anticipo para apartar el pedido (pasteles por encargo…). `depositValue`: % (1-100) o monto por pieza.
+    depositType: { type: "string", enum: Object.keys(DEPOSIT_TYPES), default: "none" },
+    depositValue: { type: "number", minimum: 0, maximum: 10_000_000, default: 0 },
   },
   ["id", "name", "categoryId", "price"],
 );

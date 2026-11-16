@@ -84,11 +84,34 @@ export const LIMITS = Object.freeze({
   DELIVERY_AREAS: 20,
   ORDER_ITEMS: 50,
   ORDER_QUANTITY: 99,
+  // Comprobantes de pago que un cliente puede subir por pedido.
+  ORDER_PROOFS: 3,
+  // Horas que tiene el cliente para mandar su anticipo (lo elige el negocio).
+  DEPOSIT_HOURS_MIN: 1,
+  DEPOSIT_HOURS_MAX: 168,
 });
 
 // Cómo recibe el cliente su pedido: en un lugar que define el negocio, a domicilio,
 // o «lo coordinamos» (solo cuando el negocio no configuró ninguna de las dos).
 export const DELIVERY_TYPES = { point: "Punto de entrega", home: "A domicilio", arrange: "Por coordinar" };
 
-// Ciclo de vida de un pedido.
-export const ORDER_STATUSES = { new: "Nuevo", confirmed: "Confirmado", onTheWay: "En camino", delivered: "Entregado", cancelled: "Cancelado" };
+// Ciclo de vida de un pedido. Con anticipo empieza en «awaiting_deposit»; sin anticipo, en «new».
+export const ORDER_STATUSES = {
+  awaiting_deposit: "Esperando anticipo",
+  new: "Nuevo",
+  confirmed: "Confirmado",
+  delivered: "Entregado",
+  cancelled: "Cancelado",
+};
+
+// A qué estados puede pasar un pedido desde cada estado (el admin no puede saltarse pasos ni revivir un cancelado).
+export const ORDER_TRANSITIONS = {
+  awaiting_deposit: ["confirmed", "cancelled"],
+  new: ["confirmed", "cancelled"],
+  confirmed: ["delivered", "cancelled"],
+  delivered: [],
+  cancelled: [],
+};
+
+// Anticipo por producto: ninguno, un porcentaje del precio o una cantidad fija por pieza.
+export const DEPOSIT_TYPES = { none: "Sin anticipo", percent: "Porcentaje", fixed: "Cantidad fija" };

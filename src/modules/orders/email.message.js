@@ -2,7 +2,7 @@
 // Diseño con tablas y estilos en línea (lo único que respetan Gmail, Outlook y Apple Mail), con los colores
 // y el logo del negocio guardados en el pedido (`order.brand`) y miniaturas de los productos.
 // Todo texto que viene del cliente o del negocio se escapa.
-import { formatAddress, formatDeliveryDate, formatFolio, formatPhone, priceFormatter } from "./orders.message.js";
+import { formatAddress, formatDateTime, formatDeliveryDate, formatFolio, formatPhone, priceFormatter } from "./orders.message.js";
 
 const escape = (value = "") => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -139,6 +139,48 @@ const notesBlock = (order, colors) =>
     ? `${sectionTitle("📝 Notas del pedido", colors)}<div style="background:${colors.surface};border-radius:12px;padding:14px 16px;font-size:14px;line-height:1.5;color:${colors.text}">${escape(order.notes)}</div>`
     : "";
 
+/** Dígitos en grupos de 4 para leerlos y dictarlos sin error. */
+export const groupDigits = (value = "") => value.replace(/(\d{4})(?=\d)/g, "$1 ");
+
+/** Anticipo pendiente: cuánto, hasta cuándo y cuánto resta. */
+function depositBlock(order, colors) {
+  if (!(order.deposit > 0)) return "";
+  const price = priceFormatter(order);
+  return `${sectionTitle("⏳ Anticipo para confirmar tu pedido", colors)}
+    <div style="border:2px solid ${colors.accent};border-radius:12px;padding:16px;text-align:center">
+      <div style="font-size:13px;color:${colors.muted}">Transfiere</div>
+      <div style="margin:2px 0;font-size:30px;font-weight:800;color:${colors.accent}">${price.format(order.deposit)}</div>
+      <div style="font-size:13px;color:${colors.text}">antes del <strong>${escape(formatDateTime(order.depositDueAt, order.locale))}</strong></div>
+      <div style="margin-top:8px;font-size:12px;color:${colors.muted}">Resta ${price.format(order.total - order.deposit)} al recibir tu pedido. Si no recibimos el anticipo a tiempo, el pedido puede cancelarse.</div>
+    </div>`;
+}
+
+/** Datos para pagar por transferencia (si el negocio los activó al momento del pedido). */
+function paymentBlock(order, colors) {
+  const payment = order.brand?.payment;
+  if (!payment) return "";
+  // Lo indispensable para transferir: tarjeta (o CLABE / cuenta si no hay tarjeta) y titular.
+  const number = payment.card ? ["Tarjeta", groupDigits(payment.card)] : payment.clabe ? ["CLABE", groupDigits(payment.clabe)] : payment.account ? ["Cuenta", payment.account] : null;
+  const rows = [number, ["Titular", payment.holder]]
+    .filter((row) => row?.[1])
+    .map(
+      ([label, value]) => `<tr>
+        <td style="padding:6px 0;font-size:13px;color:${colors.muted}">${label}</td>
+        <td align="right" style="padding:6px 0;font-size:15px;font-weight:700;color:${colors.text};font-family:ui-monospace,Menlo,Consolas,monospace">${escape(value)}</td>
+      </tr>`,
+    )
+    .join("");
+  const qr = /^https:\/\//.test(payment.qrUrl ?? "")
+    ? `<div style="margin-top:12px;text-align:center"><img src="${escape(payment.qrUrl)}" width="180" alt="Código QR para pagar" style="display:inline-block;width:180px;max-width:100%;border:0;border-radius:8px"></div>`
+    : "";
+  return `${sectionTitle("💳 Datos para tu pago", colors)}
+    <div style="background:${tint(colors.accent, 0.06)};border-radius:12px;padding:12px 16px">
+      <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${rows}</table>
+      ${qr}
+      ${payment.instructions ? `<div style="margin-top:10px;font-size:13px;line-height:1.5;color:${colors.text}">${escape(payment.instructions)}</div>` : ""}
+    </div>`;
+}
+
 function footer(order, colors, closing) {
   const brand = order.brand ?? {};
   const lines = [brand.address && `📍 ${escape(brand.address)}`, brand.hours && `🕒 ${escape(brand.hours)}`].filter(Boolean);
@@ -192,6 +234,11 @@ export function businessEmail(order) {
       <div style="margin-top:14px;font-size:32px;font-weight:800;color:${colors.primary}">${price.format(order.total)}${
         order.approximate ? `<span style="font-size:14px;font-weight:600;color:${colors.muted}"> aprox.</span>` : ""
       }</div>
+      ${
+        order.deposit > 0
+          ? `<div style="margin-top:8px;font-size:14px;color:${colors.text}">💳 Anticipo: <strong>${price.format(order.deposit)}</strong> · esperando pago hasta el ${escape(formatDateTime(order.depositDueAt, order.locale))}</div>`
+          : ""
+      }
     </div>
 
     ${sectionTitle("👤 Cliente", colors)}
@@ -228,7 +275,12 @@ export function customerEmail(order) {
   const price = priceFormatter(order);
   const whatsapp = order.brand?.whatsapp;
 
-  const steps = ["Revisamos tu pedido y la disponibilidad.", "Te contactamos para confirmar el total y la entrega.", "Recibes tu pedido el día que elegiste."]
+  const hasDeposit = order.deposit > 0;
+  const steps = (
+    hasDeposit
+      ? ["Transfiere tu anticipo usando tu folio como concepto.", "Sube la foto de tu comprobante en «Mis pedidos» o mándala por WhatsApp.", "Al ver el pago en el banco confirmamos tu pedido y te avisamos."]
+      : ["Revisamos tu pedido y la disponibilidad.", "Te contactamos para confirmar el total y la entrega.", "Recibes tu pedido el día que elegiste."]
+  )
     .map(
       (text, index) => `<tr>
         <td width="34" valign="top" style="padding:6px 0"><div style="width:24px;height:24px;border-radius:999px;background:${tint(colors.accent, 0.12)};color:${colors.accent};text-align:center;line-height:24px;font-size:12px;font-weight:700">${index + 1}</div></td>
@@ -253,6 +305,9 @@ export function customerEmail(order) {
     ${itemsTable(order, colors)}
     ${notesBlock(order, colors)}
 
+    ${depositBlock(order, colors)}
+    ${paymentBlock(order, colors)}
+
     ${sectionTitle("¿Qué sigue?", colors)}
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0">${steps}</table>
 
@@ -263,7 +318,9 @@ export function customerEmail(order) {
     }`;
 
   return {
-    subject: `✅ Recibimos tu pedido ${formatFolio(order.number)} · ${name}`,
+    subject: hasDeposit
+      ? `⏳ Recibimos tu pedido ${formatFolio(order.number)}: falta tu anticipo · ${name}`
+      : `✅ Recibimos tu pedido ${formatFolio(order.number)} · ${name}`,
     html: layout(colors, order, {
       preheader: `Folio ${formatFolio(order.number)} · ${price.format(order.total)}. Te contactaremos para confirmarlo.`,
       body,
@@ -271,4 +328,61 @@ export function customerEmail(order) {
     }),
     replyTo: order.businessEmail || order.brand?.email || undefined,
   };
+}
+
+/** Correo al cliente cuando el negocio confirma o cancela su pedido. `null` si ese cambio no se avisa. */
+export function statusEmail(order) {
+  const colors = palette(order);
+  const name = order.brand?.name || order.businessName || "Tu pedido";
+  const price = priceFormatter(order);
+  const folio = formatFolio(order.number);
+  const whatsapp = order.brand?.whatsapp;
+  const first = escape(order.customer.name.split(" ")[0]);
+  const ask = whatsapp
+    ? `<div style="margin-top:24px;text-align:center">${button(`https://wa.me/${whatsapp}?text=${encodeURIComponent(`Hola, tengo una pregunta sobre mi pedido ${folio}`)}`, "💬 Escríbenos", colors)}</div>`
+    : "";
+
+  if (order.status === "confirmed") {
+    const paid = order.deposit > 0;
+    const body = `
+      <div style="text-align:center">
+        <div style="margin:0 auto;width:64px;height:64px;border-radius:999px;background:${tint(colors.accent, 0.12)};color:${colors.accent};line-height:64px;font-size:30px;font-weight:700">✓</div>
+        <h1 style="margin:16px 0 6px;font-size:26px;line-height:1.2;color:${colors.text}">¡Tu pedido está confirmado, ${first}!</h1>
+        <div style="font-size:16px;color:${colors.muted}">${paid ? `Recibimos tu anticipo de <strong style="color:${colors.text}">${price.format(order.deposit)}</strong>.` : "Ya estamos trabajando en él."}</div>
+        <div style="margin-top:14px">${folioPill(order, colors)}</div>
+      </div>
+      ${sectionTitle("🚚 Entrega", colors)}
+      ${infoCards(order, colors)}
+      ${
+        paid
+          ? `<div style="margin-top:16px;background:${colors.surface};border-radius:12px;padding:14px 16px;font-size:14px;color:${colors.text}">Resta por pagar al recibir: <strong>${price.format(order.total - order.deposit)}</strong>${order.approximate ? " (aproximado)" : ""}</div>`
+          : ""
+      }
+      ${ask}`;
+    return {
+      subject: `✅ Tu pedido ${folio} está confirmado · ${name}`,
+      html: layout(colors, order, { preheader: `Pedido ${folio} confirmado.`, body, closing: `Recibiste este correo por tu pedido en ${escape(name)}.` }),
+      replyTo: order.businessEmail || order.brand?.email || undefined,
+    };
+  }
+
+  if (order.status === "cancelled") {
+    const body = `
+      <div style="text-align:center">
+        <h1 style="margin:8px 0 6px;font-size:24px;line-height:1.2;color:${colors.text}">Tu pedido ${folio} fue cancelado</h1>
+        <div style="font-size:15px;line-height:1.5;color:${colors.muted}">${
+          order.deposit > 0 && !order.depositPaidAt
+            ? "No recibimos tu anticipo a tiempo. Si ya lo pagaste, respóndenos con tu comprobante y lo revisamos."
+            : "Si crees que es un error o quieres hacer un nuevo pedido, escríbenos."
+        }</div>
+      </div>
+      ${ask}`;
+    return {
+      subject: `Tu pedido ${folio} fue cancelado · ${name}`,
+      html: layout(colors, order, { preheader: `Pedido ${folio} cancelado.`, body, closing: `Recibiste este correo por tu pedido en ${escape(name)}.` }),
+      replyTo: order.businessEmail || order.brand?.email || undefined,
+    };
+  }
+
+  return null;
 }

@@ -57,6 +57,8 @@ export const PRODUCT_DEFAULTS = {
   customizable: false,
   allowNotes: false,
   options: [],
+  depositType: "none",
+  depositValue: 0,
 };
 
 const createSection = (type, { id, props = {} }) => ({
@@ -86,6 +88,18 @@ export const DEFAULT_SITE = {
     deliveryPoints: [{ name: "Recoger en el local", details: "Te avisamos cuando tu pedido esté listo." }],
     homeDelivery: true,
     deliveryAreas: [{ city: "Querétaro", state: "Querétaro" }],
+    payment: {
+      enabled: false,
+      bank: "",
+      holder: "",
+      clabe: "",
+      card: "",
+      account: "",
+      phone: "",
+      qrUrl: "",
+      instructions: "Usa tu folio como concepto. Al terminar puedes subir la foto de tu comprobante.",
+      depositHours: 24,
+    },
   },
   theme: {
     template: "classic",

@@ -56,9 +56,23 @@ export function buildItems(products, items) {
       imageUrl: product.imageUrl ?? "",
       choices,
       note: product.customizable && product.allowNotes ? clean(item.note) : "",
+      deposit: depositFor(product, unitPrice * item.quantity, item.quantity),
     };
   });
 }
+
+const toCents = (value) => Math.round(value * 100) / 100;
+
+/** Anticipo de una línea: % del subtotal o monto fijo por pieza, nunca más que el subtotal. */
+export function depositFor(product, subtotal, quantity) {
+  const value = Number(product.depositValue) || 0;
+  if (product.depositType === "percent") return toCents((subtotal * Math.min(value, 100)) / 100);
+  if (product.depositType === "fixed") return toCents(Math.min(value * quantity, subtotal));
+  return 0;
+}
+
+/** Anticipo total del pedido (suma de sus líneas). */
+export const orderDeposit = (items) => toCents(items.reduce((sum, item) => sum + (item.deposit ?? 0), 0));
 
 /** Valida la forma de entrega contra lo que configuró el negocio y la deja normalizada. */
 export function resolveDelivery(business, delivery) {

@@ -163,7 +163,53 @@ describe("guardar el sitio", () => {
     assert.equal((await getAdminSite()).business.$where, undefined);
   });
 
+  test("guarda los datos para transferencia y los publica", async () => {
+    const site = await getAdminSite();
+    assert.equal(site.business.payment.enabled, false, "desactivado por defecto");
+    site.business.payment = { ...site.business.payment, enabled: true, bank: "BBVA", holder: "Ana López", clabe: "032180000118359719", card: "4111111111111111" };
+    assert.equal((await saveSite(site)).statusCode, 200);
+    const published = (await app.inject({ method: "GET", url: api("/site") })).json();
+    assert.equal(published.business.payment.clabe, "032180000118359719");
+  });
+
+  test("un sitio guardado antes de existir los pagos recibe los valores por defecto", async () => {
+    const site = await getAdminSite();
+    delete site.business.payment;
+    assert.equal((await saveSite(site)).statusCode, 200);
+    assert.equal((await getAdminSite()).business.payment.enabled, false);
+  });
+
+  const withPayment = (fields) => (site) => (site.business.payment = { ...site.business.payment, enabled: true, holder: "Ana López", ...fields });
+
   const invalidCases = [
+    ["una CLABE con dígito verificador incorrecto", withPayment({ clabe: "032180000118359718" })],
+    ["una CLABE incompleta", withPayment({ clabe: "03218000011835" })],
+    ["una CLABE con letras", withPayment({ clabe: "03218000011835971a" })],
+    ["una tarjeta que no pasa la prueba de Luhn", withPayment({ card: "4111111111111112" })],
+    ["pagos activados sin ningún dato para pagar", withPayment({ clabe: "", card: "", account: "", phone: "", qrUrl: "" })],
+    ["pagos activados sin titular", withPayment({ clabe: "032180000118359719", holder: " " })],
+    [
+      "un producto con anticipo sin datos para transferir",
+      (site) => {
+        site.business.payment = { ...site.business.payment, enabled: false };
+        Object.assign(site.products[0], { depositType: "percent", depositValue: 50 });
+      },
+    ],
+    [
+      "un anticipo de más de 100 %",
+      (site) => {
+        withPayment({ clabe: "032180000118359719" })(site);
+        Object.assign(site.products[0], { depositType: "percent", depositValue: 150 });
+      },
+    ],
+    [
+      "un anticipo fijo en cero",
+      (site) => {
+        withPayment({ clabe: "032180000118359719" })(site);
+        Object.assign(site.products[0], { depositType: "fixed", depositValue: 0 });
+      },
+    ],
+    ["un tipo de anticipo inexistente", (site) => (site.products[0].depositType = "todo")],
     ["un color inválido", (site) => (site.theme.colors.primary = "rojo")],
     ["una plantilla que no existe", (site) => (site.theme.template = "inventada")],
     ["una fuente fuera del catálogo", (site) => (site.theme.fonts.body = "Comic Sans")],

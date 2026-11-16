@@ -1,6 +1,7 @@
 import { httpError } from "../../lib/httpError.js";
 import { LIMITS } from "../../shared/catalog.js";
 import { DEFAULT_SITE } from "../../shared/defaults.js";
+import { paymentProblem } from "../../shared/payment.js";
 
 const onlyVisible = (site) => ({ ...site, products: site.products.filter((product) => product.active) });
 
@@ -40,6 +41,23 @@ function assertConsistent(site) {
   const areaKeys = deliveryAreas.map((area) => `${area.city}|${area.state}`.trim().toLowerCase());
   const repeatedArea = deliveryAreas.find((_, index) => areaKeys.indexOf(areaKeys[index]) !== index);
   if (repeatedArea) throw httpError(400, `La zona «${repeatedArea.city}» está repetida`);
+
+  const payment = paymentProblem(site.business.payment);
+  if (payment) throw httpError(400, payment);
+
+  // Un anticipo sin datos para transferir dejaría al cliente sin saber a dónde pagar.
+  const withDeposit = site.products.filter((product) => product.depositType !== "none");
+  if (withDeposit.length && !site.business.payment?.enabled) {
+    throw httpError(400, `«${withDeposit[0].name}» pide anticipo: activa los datos para transferencia en Negocio → Pagos`);
+  }
+  for (const product of withDeposit) {
+    if (product.depositType === "percent" && !(product.depositValue >= 1 && product.depositValue <= 100)) {
+      throw httpError(400, `El anticipo de «${product.name}» debe ser de 1 a 100 %`);
+    }
+    if (product.depositType === "fixed" && !(product.depositValue > 0)) {
+      throw httpError(400, `Escribe el monto del anticipo de «${product.name}»`);
+    }
+  }
 
   const featuredCount = site.products.filter((product) => product.featured).length;
   if (featuredCount > LIMITS.FEATURED_PRODUCTS) {

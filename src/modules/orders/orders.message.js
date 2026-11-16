@@ -34,6 +34,20 @@ export function formatPhone(phone = "") {
   return phone;
 }
 
+// Zona horaria del negocio para fechas con hora (el servidor puede correr en UTC).
+export const BUSINESS_TIME_ZONE = "America/Mexico_City";
+
+/** "lunes, 10 de noviembre, 1:00 p.m." en la hora del negocio. */
+export function formatDateTime(value, locale = FALLBACK_REGION.locale) {
+  if (!value) return "";
+  const options = { weekday: "long", day: "numeric", month: "long", hour: "numeric", minute: "2-digit", timeZone: BUSINESS_TIME_ZONE };
+  try {
+    return new Date(value).toLocaleString(locale, options);
+  } catch {
+    return new Date(value).toLocaleString(FALLBACK_REGION.locale, options);
+  }
+}
+
 export const formatFolio = (number) => `#${String(number).padStart(4, "0")}`;
 
 export function formatAddress(address) {
@@ -85,8 +99,30 @@ export function formatOrderMessage(order) {
     ...items,
     "",
     `💰 <b>Total${order.approximate ? " aproximado" : ""}: ${price.format(order.total)}</b>`,
+    ...depositLines(order, price),
     order.notes ? `\n📝 <b>Notas:</b> ${escape(order.notes)}` : null,
   ]
     .filter((line) => line !== null)
     .join("\n");
+}
+
+function depositLines(order, price) {
+  if (!(order.deposit > 0)) return [];
+  return [
+    `💳 <b>Anticipo: ${price.format(order.deposit)}</b> · resta ${price.format(order.total - order.deposit)}`,
+    `⏳ Esperando anticipo hasta el ${escape(formatDateTime(order.depositDueAt, order.locale))}`,
+    "   Confírmalo en el admin → Pedidos cuando lo veas en tu banco.",
+  ];
+}
+
+/** Aviso al negocio: el cliente subió un comprobante. */
+export function formatProofMessage(order) {
+  const price = priceFormatter(order);
+  return [
+    `📎 <b>Comprobante recibido · pedido ${formatFolio(order.number)}</b>`,
+    `👤 ${escape(order.customer.name)}`,
+    order.deposit > 0 ? `💳 Anticipo esperado: <b>${price.format(order.deposit)}</b>` : `💰 Total: <b>${price.format(order.total)}</b>`,
+    "",
+    "Revisa en tu app del banco que el dinero sí llegó y confírmalo en el admin → Pedidos.",
+  ].join("\n");
 }

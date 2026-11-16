@@ -1,18 +1,25 @@
-// Crear un pedido: 1) validar y recalcular con el catálogo, 2) GUARDAR, 3) responder al cliente,
-// 4) avisar al negocio en segundo plano. Si el aviso falla, el pedido ya está guardado
-// y se reintenta solo (ver `retryPending`).
+// Crear un pedido: 1) validar y recalcular con el catálogo, 2) GUARDAR, 3) avisar al negocio
+// (primer intento, con tope de tiempo; ver `notifyBeforeReply`), 4) responder al cliente.
+// Si el aviso falla, el pedido ya está guardado y se reintenta solo (ver `retryPending`).
 import { randomUUID } from "node:crypto";
 import { httpError } from "../../lib/httpError.js";
 import { DEFAULT_SITE } from "../../shared/defaults.js";
 import { formatAddress, formatFolio } from "./orders.message.js";
 import { NOTIFICATION, isDuplicateKeyError, newNotification } from "./orders.repository.js";
-import { PHONE_PATTERN, buildItems, cleanText, localPhone, normalizeCustomer, resolveDelivery, resolveDeliveryDate } from "./orders.rules.js";
+import { PHONE_PATTERN, buildItems, cleanText, localPhone, normalizeCustomer, orderDeposit, resolveDelivery, resolveDeliveryDate } from "./orders.rules.js";
+import { LIMITS, ORDER_STATUSES, ORDER_TRANSITIONS } from "../../shared/catalog.js";
 
 const MY_ORDERS_LIMIT = 50;
+const ADMIN_PAGE = 30;
+const HOUR_MS = 60 * 60 * 1000;
+// Mientras el pedido no se confirme ni se cancele, el cliente puede subir su comprobante.
+const PROOF_STATUSES = ["awaiting_deposit", "new"];
 
 const MIN_PHONE_DIGITS = 10;
 export const NOTIFY_POLICY = Object.freeze({
   LOCK_MS: 30_000,
+  // Tope de espera de los avisos antes de responder al cliente (Telegram tarda <1 s, Gmail 1-3 s).
+  WAIT_BEFORE_REPLY_MS: 8_000,
   // 1, 2, 4, 8, 16 y luego cada 30 min: cubre una caída de Telegram o del correo de varias horas.
   MAX_ATTEMPTS: 12,
   FIRST_RETRY_MS: 60_000,
@@ -32,6 +39,8 @@ const toReceipt = (order) => ({
   approximate: order.approximate,
   deliveryDate: order.deliveryDate,
   createdAt: order.createdAt,
+  deposit: order.deposit ?? 0,
+  depositDueAt: order.depositDueAt ?? null,
 });
 
 /** Entrega en una línea legible para el cliente. */
@@ -62,7 +71,38 @@ const toCustomerOrder = (order) => ({
   approximate: Boolean(order.approximate),
   notes: order.notes ?? "",
   name: order.customer?.name ?? "",
+  deposit: order.deposit ?? 0,
+  depositDueAt: order.depositDueAt ?? null,
+  depositPaidAt: order.depositPaidAt ?? null,
+  proofCount: order.proofs?.length ?? 0,
 });
+
+/** Un pedido para el panel: todo menos datos internos de envío. Los comprobantes, solo por id. */
+const toAdminOrder = (order) => ({
+  number: order.number,
+  folio: formatFolio(order.number),
+  status: order.status ?? "new",
+  statusLabel: ORDER_STATUSES[order.status] ?? ORDER_STATUSES.new,
+  nextStatuses: ORDER_TRANSITIONS[order.status ?? "new"] ?? [],
+  createdAt: order.createdAt,
+  statusChangedAt: order.statusChangedAt ?? null,
+  customer: order.customer,
+  deliveryDate: order.deliveryDate,
+  delivery: { type: order.delivery?.type ?? "arrange", label: describeDelivery(order.delivery) },
+  items: (order.items ?? []).map(({ name, quantity, subtotal, choices = [], note = "", deposit = 0 }) => ({ name, quantity, subtotal, choices, note, deposit })),
+  notes: order.notes ?? "",
+  total: order.total,
+  approximate: Boolean(order.approximate),
+  deposit: order.deposit ?? 0,
+  depositDueAt: order.depositDueAt ?? null,
+  depositPaidAt: order.depositPaidAt ?? null,
+  proofs: (order.proofs ?? []).map(({ id, uploadedAt }) => ({ id, uploadedAt })),
+  currency: order.currency,
+  locale: order.locale,
+});
+
+const PAYMENT_FIELDS = ["bank", "holder", "clabe", "card", "account", "phone", "qrUrl", "instructions"];
+const paymentSnapshot = (payment) => Object.fromEntries(PAYMENT_FIELDS.map((key) => [key, payment[key] ?? ""]));
 
 const BRAND_COLORS = ["primary", "primaryText", "accent", "background", "surface", "text", "muted"];
 
@@ -78,13 +118,15 @@ function brandSnapshot(business, theme) {
     instagram: business.instagram ?? "",
     facebook: business.facebook ?? "",
     colors: Object.fromEntries(BRAND_COLORS.map((key) => [key, theme?.colors?.[key] ?? ""])),
+    // Datos de transferencia vigentes al hacer el pedido: el comprobante muestra a dónde pagar ESE pedido.
+    payment: business.payment?.enabled ? paymentSnapshot(business.payment) : null,
   };
 }
 
 const CHANNEL_LABELS = { telegram: "Telegram", businessEmail: "correo al negocio", customerEmail: "comprobante al cliente" };
 
 /** `notifiers`: canales configurados (ver notifiers.js). Cada uno se envía y reintenta por separado. */
-export function createOrdersService({ repository, siteRepository, notifiers = [], log }) {
+export function createOrdersService({ repository, siteRepository, notifiers = [], messengers = null, log }) {
   const inFlight = new Set();
   const byChannel = new Map(notifiers.map((notifier) => [notifier.channel, notifier]));
 
@@ -116,14 +158,26 @@ export function createOrdersService({ repository, siteRepository, notifiers = []
     }
   }
 
-  /** Corre los avisos sin bloquear la respuesta; se esperan al cerrar el servidor. */
-  function notifyInBackground(orderId) {
-    for (const { channel } of notifiers) {
+  /**
+   * Manda los avisos (en paralelo) y espera a que terminen antes de responder, con un tope de tiempo.
+   * No se dejan «en segundo plano»: en hostings que congelan el CPU al responder (Cloud Run, Render,
+   * Railway…) el envío se quedaba detenido hasta la siguiente petición y llegaba 10-20 min tarde.
+   * Si pasa el tope, la respuesta sale igual y el aviso sigue (o lo toma `retryPending`).
+   */
+  async function notifyBeforeReply(orderId) {
+    const tasks = notifiers.map(({ channel }) => {
       const task = notify(orderId, channel)
         .catch((error) => log.error({ err: error }, "Error al avisar el pedido"))
         .finally(() => inFlight.delete(task));
       inFlight.add(task);
-    }
+      return task;
+    });
+    let timer;
+    const limit = new Promise((resolve) => {
+      timer = setTimeout(resolve, NOTIFY_POLICY.WAIT_BEFORE_REPLY_MS);
+    });
+    await Promise.race([Promise.allSettled(tasks), limit]);
+    clearTimeout(timer);
   }
 
   return {
@@ -141,12 +195,18 @@ export function createOrdersService({ repository, siteRepository, notifiers = []
       const items = buildItems(products, input.items);
       const delivery = resolveDelivery(business, input.delivery);
       const deliveryDate = resolveDeliveryDate(input.deliveryDate);
+      // El anticipo solo aplica si el negocio tiene a dónde recibirlo.
+      const paymentOn = Boolean(business.payment?.enabled);
+      if (!paymentOn) for (const item of items) item.deposit = 0;
+      const deposit = orderDeposit(items);
+      const createdAt = new Date();
+      const status = deposit > 0 ? "awaiting_deposit" : "new";
 
       const draft = {
         requestId: input.requestId,
         publicId: randomUUID(),
         number: await repository.nextNumber(),
-        status: "new",
+        status,
         customer,
         deliveryDate,
         delivery,
@@ -160,7 +220,12 @@ export function createOrdersService({ repository, siteRepository, notifiers = []
         brand: brandSnapshot(business, theme),
         currency: business.currency,
         locale: business.locale,
-        createdAt: new Date(),
+        createdAt,
+        deposit,
+        depositDueAt: deposit > 0 ? new Date(createdAt.getTime() + (business.payment.depositHours ?? 24) * HOUR_MS) : null,
+        depositPaidAt: null,
+        proofs: [],
+        statusHistory: [{ status, at: createdAt }],
         notifications: {},
       };
       for (const notifier of notifiers) {
@@ -176,7 +241,7 @@ export function createOrdersService({ repository, siteRepository, notifiers = []
         throw error;
       }
 
-      notifyInBackground(order._id);
+      await notifyBeforeReply(order._id);
       return toReceipt(order);
     },
 
@@ -188,6 +253,59 @@ export function createOrdersService({ repository, siteRepository, notifiers = []
       const phones = [...new Set([customer.phone, localPhone(customer.phone)])];
       const found = await repository.findByCustomer({ email: customer.email, phones, limit: MY_ORDERS_LIMIT });
       return found.map(toCustomerOrder);
+    },
+
+    /**
+     * El cliente sube la foto de su comprobante. `publicId` (UUID que solo tiene el cliente) es la llave:
+     * no se puede adivinar ni recorrer como un folio.
+     */
+    async addProof(publicId, image) {
+      const order = await repository.findByPublicId(publicId);
+      if (!order) throw httpError(404, "No encontramos ese pedido");
+      if (!PROOF_STATUSES.includes(order.status)) throw httpError(409, "Este pedido ya no recibe comprobantes. Escríbenos si necesitas ayuda.");
+      if ((order.proofs?.length ?? 0) >= LIMITS.ORDER_PROOFS) throw httpError(409, `Ya subiste ${LIMITS.ORDER_PROOFS} comprobantes para este pedido`);
+
+      const updated = await repository.addProof(publicId, image, { statuses: PROOF_STATUSES, max: LIMITS.ORDER_PROOFS });
+      if (!updated) throw httpError(409, "No se pudo agregar el comprobante. Recarga e inténtalo de nuevo.");
+      await messengers?.proofReceived(updated).catch((error) => log.warn({ folio: formatFolio(updated.number), reason: error.message }, "No se pudo avisar del comprobante"));
+      return { proofCount: updated.proofs.length };
+    },
+
+    // ── Admin ───────────────────────────────────────────────────────────────────────────────
+
+    /** `status`: un estado, "open" (por atender) o vacío (todos). `before`: folio para la página siguiente. */
+    async listForAdmin({ status, before }) {
+      const statuses = status === "open" ? ["awaiting_deposit", "new", "confirmed"] : status ? [status] : null;
+      const [found, counts] = await Promise.all([repository.listForAdmin({ statuses, before, limit: ADMIN_PAGE + 1 }), repository.countByStatus()]);
+      return { orders: found.slice(0, ADMIN_PAGE).map(toAdminOrder), hasMore: found.length > ADMIN_PAGE, counts };
+    },
+
+    /** Mueve el pedido al siguiente estado (solo transiciones permitidas) y avisa al cliente. */
+    async changeStatus(number, to) {
+      const current = await repository.findByNumber(number);
+      if (!current) throw httpError(404, "No encontramos ese pedido");
+      const from = Object.keys(ORDER_TRANSITIONS).filter((status) => ORDER_TRANSITIONS[status].includes(to));
+      const fromStatus = current.status ?? "new";
+      if (!from.includes(fromStatus)) {
+        throw httpError(409, `Un pedido «${ORDER_STATUSES[fromStatus] ?? fromStatus}» no puede pasar a «${ORDER_STATUSES[to] ?? to}»`);
+      }
+
+      const now = new Date();
+      // Confirmar un pedido que esperaba anticipo = el anticipo llegó.
+      const set = fromStatus === "awaiting_deposit" && to === "confirmed" ? { depositPaidAt: now } : {};
+      const updated = await repository.changeStatus(number, { from: [fromStatus], to, set, now });
+      if (!updated) throw httpError(409, "El pedido cambió mientras tanto. Recarga la lista.");
+
+      log.info({ folio: formatFolio(number), from: fromStatus, to }, "Estado del pedido actualizado");
+      await messengers?.statusChanged(updated).catch((error) => log.warn({ folio: formatFolio(number), reason: error.message }, "No se pudo avisar al cliente del cambio"));
+      return toAdminOrder(updated);
+    },
+
+    /** Imagen de un comprobante (solo admin). */
+    async getProof(id) {
+      const proof = await repository.findProof(id);
+      if (!proof) throw httpError(404, "Comprobante no encontrado");
+      return proof;
     },
 
     /** Reintenta los avisos de pedidos recientes que no se pudieron enviar. */

@@ -21,9 +21,9 @@ const loggerFor = (env) =>
 
 /**
  * Construye la app sin escuchar en un puerto: así se reutiliza en el servidor y en las pruebas.
- * `orderNotifiers` reemplaza a Telegram y al correo (pruebas).
+ * `orderNotifiers` y `orderMessengers` reemplazan a Telegram y al correo (pruebas).
  */
-export async function buildApp(env, { orderNotifiers } = {}) {
+export async function buildApp(env, { orderNotifiers, orderMessengers } = {}) {
   const app = Fastify({
     logger: loggerFor(env),
     bodyLimit: BODY_LIMIT_BYTES,
@@ -57,6 +57,7 @@ export async function buildApp(env, { orderNotifiers } = {}) {
         email: env.EMAIL,
         emailError: env.EMAIL_ERROR,
         notifiers: orderNotifiers,
+        messengers: orderMessengers,
         maxPerWindow: env.ORDER_MAX_PER_WINDOW,
         window: env.ORDER_WINDOW,
       });
