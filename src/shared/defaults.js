@@ -91,6 +91,7 @@ export const DEFAULT_SITE = {
     payment: {
       enabled: false,
       bank: "",
+      cardColor: "",
       holder: "",
       clabe: "",
       card: "",

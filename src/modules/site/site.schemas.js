@@ -72,6 +72,8 @@ const business = object(
       ...object({
         enabled: { type: "boolean", default: false },
         bank: text(60),
+        // Color de la tarjeta que ve el cliente. Vacío: el del banco (si es de la lista) o el del tema.
+        cardColor: { type: "string", pattern: "^(#[0-9a-fA-F]{6})?$", default: "" },
         holder: text(100),
         clabe: { type: "string", pattern: "^[0-9]{0,18}$", default: "" },
         card: { type: "string", pattern: "^[0-9]{0,16}$", default: "" },
